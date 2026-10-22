@@ -104,6 +104,9 @@ fn Gematria() -> impl IntoView {
                         Key::Named(NamedKey::Delete) => {
                             if let Ok(key) = parse_u8_list(&txt.get()) {
                                 if let Ok(was) = forget(&key) {
+                                    display_output.update(move |disout| {
+                                        disout.remove_entry(&key);
+                                    });
                                     if let Ok(stwing) = String::from_utf8(was) {
                                         txt.update(move |t| *t = stwing);
                                     }
