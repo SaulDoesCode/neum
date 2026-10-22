@@ -1,4 +1,4 @@
-![neum app screenshot and code in the background](./Screenshot_2026-10-21_21-45-48.png)
+![neum app screenshot and code in the background](./Screenshot_2026-10-22_16-58-36.png)
 
 ordinal and reversed gematria, in a stateful redb app that uses zgui for a basic interface
 
