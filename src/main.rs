@@ -165,9 +165,6 @@ const STYLE: &str = css!("
         position: fixed;
         bottom: 0;
         width: calc(99% - 2mm);
-        min-height: 128px;
-        padding-left: 1mm;
-        padding-right: 1mm;
         gap: 12px; 
         align-items: center;
         justify-content: center;
@@ -206,7 +203,9 @@ const STYLE: &str = css!("
         pointer-events: none;
     }
     .spread {
-        width: 100%;
+        flex-flow: row wrap;
+        width: calc(100% - 2mm);
+        height: auto;
         padding: 1mm;
         text-align: center;
         justify-content: center;
