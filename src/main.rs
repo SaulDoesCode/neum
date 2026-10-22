@@ -36,24 +36,37 @@ fn Gematria() -> impl IntoView {
                 if let Ok(v) = String::from_utf8(v) {
                     let ov = v.to_string();
                     let key = format!("{:?}", k).replace("\"", "").replace("[", "").replace("]", "");
+                    let (o, r) = sums(v.as_bytes());
+                    let culr = color_for_sum(if o_or_r.get() { r } else { o });
+                    let unrlnclr = format!("{:?},{:?},{:?}", culr[0], culr[1], culr[2]);
+
                     els.push(view!{
-                        text(class = "otxt",
-                        class:underline = move || !sch.get(),
-                        on:double_click = move |_| {
-                            let key = key.clone();
-                            txt.update(move |t| *t = key);
-                        },
-                        on:click = move |_| {
-                            let ov = ov.to_string();
-                            txt.update(move |t| *t = ov.to_string());
-                            let (o, r) = sums(txt.get().as_bytes());
-                            if osum.get() != o {
-                                osum.update(move |n| *n = o);
+                        box(
+                            class = "otxt",
+                            style = format!("border-bottom: 3px solid rgb({});", unrlnclr),
+                            on:double_click = move |_| {
+                                let key = key.clone();
+                                txt.update(move |t| *t = key);
+                            },
+                            on:context_menu = move |ev| {
+                                if ev.modifiers == Modifiers::CONTROL {
+                                    let n = (osum.get() as f64 * rsum.get() as f64).sqrt().round() as u64;
+                                    txt.update(move |t| *t = n.to_string());
+                                    if let Ok(out) = gsearch(n, !o_or_r.get()) {
+                                        display_output.update(move |disout| *disout = out);
+                                    }
+                                }
+                            },
+                            on:click = move |_ev| {
+                                let ov = ov.to_string();
+                                txt.update(move |t| *t = ov.to_string());
+                                let (o, r) = sums(txt.get().as_bytes());
+                                if osum.get() != o { osum.update(move |n| *n = o); }
+                                if rsum.get() != r { rsum.update(move |n| *n = r); }
                             }
-                            if rsum.get() != r {
-                                rsum.update(move |n| *n = r);
-                            }
-                        }) {{v}}
+                        ) {
+                            text() {{v}}
+                        }
                     });
                 }
             }
@@ -116,9 +129,7 @@ fn Gematria() -> impl IntoView {
                             }
                         }
                         sch.update(move |b| *b = !*b)
-                    }) {
-                        "s"
-                    }
+                    }) { "s" }
                     text(class = "o-or-r", class:hidden = move || sch.get(), on:click = move |_| o_or_r.update(move |b| *b = !*b)) { 
                         {move || {
                             if let Ok(out) = gsearch(if o_or_r.get() { osum.get() } else { rsum.get() }, !o_or_r.get()) {
@@ -154,10 +165,11 @@ const STYLE: &str = css!("
         min-height: 128px;
         padding-left: 1mm;
         padding-right: 1mm;
-        gap: 12px; align-items: center; justify-content: center; color: #fff;
-    }
-    .underline {
-        text-decoration: underline;
+        gap: 12px; 
+        align-items: center;
+        justify-content: center;
+        flex-flow: row wrap;
+        color: #fff;
     }
     .sums { margin: 1mm; padding: 1mm; width: 80%; justify-content: space-evenly; }
     .value { text-align: center; font-size: 13px; margin-top: 1mm; margin-left: 1.5mm; }
@@ -220,6 +232,25 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn hsl(h: f64, s: f64, l: f64) -> [u8; 3] {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let to = |v: f64| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    [to(r), to(g), to(b)]
+}
+
+fn color_for_sum(sum: u64) -> [u8; 3] {
+    hsl((sum as f64 * 137.507_764) % 360.0, 0.45, 0.45)
+}
 
 const ALLOCATED: &[u8] = b"allocated".as_slice();
 
