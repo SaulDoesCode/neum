@@ -22,15 +22,22 @@ use serde_json::{Value, json};
 #[component]
 fn Gematria() -> impl IntoView {
     let txt = RwSignal::new_local(String::new());
+    let alt_name = RwSignal::new_local(String::new());
     let osum = RwSignal::new(0_u64);
     let rsum = RwSignal::new(0_u64);
     let sch = RwSignal::new(false);
     let o_or_r = RwSignal::new(true);
     let sat = RwSignal::new(true);
     let display_output: RwSignal<HashMap<Vec<u8>, Vec<u8>>> = RwSignal::new(HashMap::new());
+    let esc_mode = RwSignal::new(false);
+    let term_ctx_menu = RwSignal::new(false);
 
     view! {
-        row(class = "spread") {{move || { //  'ordinary cunt' sums to 162/162
+        row(class = "spread",
+            on:click = {move |_ev| {
+                esc_mode.update(|n| *n = false);
+            }}
+        ) {{move || { //  'ordinary cunt' sums to 162/162
             let mut els = vec![];
             for (k, v) in display_output.get() {
                 if let Ok(v) = String::from_utf8(v) {
@@ -48,12 +55,16 @@ fn Gematria() -> impl IntoView {
                                 let key = key.clone();
                                 txt.update(move |t| *t = key);
                             },
-                            on:context_menu = move |ev| {
-                                if ev.modifiers == Modifiers::CONTROL {
-                                    let n = (osum.get() as f64 * rsum.get() as f64).sqrt().round() as u64;
-                                    txt.update(move |t| *t = n.to_string());
-                                    if let Ok(out) = gsearch(n, !o_or_r.get()) {
-                                        display_output.update(move |disout| *disout = out);
+                            on:pointer_down = move |ev| {
+                                if let Some(btn) = ev.button {
+                                    if btn == PointerButton::Secondary {
+                                        if ev.modifiers.control() {
+                                            let n = (osum.get() as f64 * rsum.get() as f64).sqrt().round() as u64;
+                                            txt.update(move |t| *t = n.to_string());
+                                            if let Ok(out) = gsearch(n, !o_or_r.get()) {
+                                                display_output.update(move |disout| *disout = out);
+                                            }
+                                        }
                                     }
                                 }
                             },
@@ -64,16 +75,34 @@ fn Gematria() -> impl IntoView {
                                 if osum.get() != o { osum.update(move |n| *n = o); }
                                 if rsum.get() != r { rsum.update(move |n| *n = r); }
                             }
-                        ) {
-                            text() {{v}}
-                        }
+                        ) { text() {{v}} }
                     });
                 }
             }
             els
         }}}
         column(class = "col") {
-            row(class = "inp") {
+            if move || term_ctx_menu.get() {
+                row(class = "term-menu") {
+                    Input(
+                        value = alt_name,
+                    )
+                }
+            }
+            row(
+                class = "inp",
+                on:pointer_down = move |ev| {
+                    if let Some(btn) = ev.button {
+                        if btn == PointerButton::Secondary {
+                            term_ctx_menu.update(|n| *n = !*n);
+                        } else if btn == PointerButton::Middle {
+                            let n = txt.get();
+                            alt_name.update(move |ln| *ln = n);
+                            txt.update(move |t| *t = String::new());
+                        }
+                    }
+                },
+            ) {
                 Input(
                     value = txt,
                     label = "type text to sum with gematria",
@@ -82,15 +111,86 @@ fn Gematria() -> impl IntoView {
                         osum.update(move |n| *n = o);
                         rsum.update(move |n| *n = r);
                     },
+                    on:click = move |_ev| {
+                        esc_mode.update(|n| *n = false);
+                    },
                     on:key_down = move |ev| match &ev.key {
                         Key::Named(NamedKey::Enter) => {
                             if sch.get() {
-                                let r = search(txt.get().as_bytes(), sat.get());
-                                if let Ok(out) = r { display_output.update(move |disout| *disout = out.0); }
+                                let t = txt.get();
+                                if t.len() == 0 {
+                                    let alt = alt_name.get();
+                                    if alt.len() != 0 {
+                                        let sr = search(alt.as_bytes(), false);
+                                        if let Ok((_found, that_one)) = sr {
+                                            if let Some(l) = that_one {
+                                                match get_list(&l) {
+                                                    Ok(lst) => display_output.update(move |disout| *disout = lst),
+                                                    Err(e) => println!("trouble adding thing to list: {e}")
+                                                }
+                                            } else {
+                                                display_output.update(move |disout| disout.clear());
+                                                println!("look no find.. that one");
+                                            }
+                                        } else if let Err(e) = sr {
+                                            println!("search error: {e}");
+                                        } 
+                                    }
+                                } else {
+                                    let r = search(t.as_bytes(), sat.get());
+                                    let mut k = vec![];
+                                    if let Ok(out) = r {
+                                        display_output.update(move |disout| *disout = out.0);
+                                        if let Some(key) = out.1 { k.extend_from_slice(&key); }
+                                    }
+                                    let an = alt_name.get();
+                                    if an.len() != 0 {
+                                        let sr = search(an.as_bytes(), true);
+                                        if let Ok((_found, that_one)) = sr {
+                                            if let Some(l) = that_one {
+                                                if let Err(e) = add_to_list(&l, &k) {
+                                                    println!("trouble adding thing to list: {e}");
+                                                }
+                                            } else {
+                                                println!("look no find.. that one");
+                                            }
+                                        } else if let Err(e) = sr {
+                                            display_output.update(move |disout| disout.clear());
+                                            println!("search error: {e}");
+                                        }
+                                    }
+                                }
                             } else {
-                                if let Ok(mut out) = gsearch(if let Ok(sum) = txt.get().parse::<u64>() && !ev.modifiers == Modifiers::CONTROL { sum } else if o_or_r.get() { osum.get() } else { rsum.get() }, !o_or_r.get()) {
+                                let t = txt.get();
+                                let an = alt_name.get();
+                                if an.len() != 0 && sat.get() && t.parse::<u64>().is_err() {
+                                    match gsearch(osum.get(), false) {
+                                        Ok(mut fnd) => {
+                                            let tb = t.as_bytes().to_vec();
+                                            if fnd.par_iter().find_any(|(_k, v)| tb.eq(*v)).is_none() { 
+                                                if let Ok(k) = saturate(&tb, None) {
+                                                    let sr = search(an.as_bytes(), true);
+                                                    if let Ok((_found, that_one)) = sr {
+                                                        if let Some(l) = that_one {
+                                                            if let Err(e) = note_on(&l, &k) {
+                                                                println!("trouble noting on thing: {e}");
+                                                            }
+                                                        } else {
+                                                            println!("look no find.. that one");
+                                                        }
+                                                        fnd.insert(k, tb);
+                                                    } else if let Err(e) = sr {
+                                                        display_output.update(move |disout| disout.clear());
+                                                        println!("search error: {e}");
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        Err(e) => println!("search error: {e}")
+                                    }
+                                } else if let Ok(mut out) = gsearch(if let Ok(sum) = t.parse::<u64>() && !ev.modifiers == Modifiers::CONTROL { sum } else if o_or_r.get() { osum.get() } else { rsum.get() }, !o_or_r.get()) {
                                     if sat.get() {
-                                        if txt.get().parse::<u64>().is_err() {
+                                        if t.parse::<u64>().is_err() {
                                             let tb = txt.get().as_bytes().to_vec();
                                             if out.par_iter().find_any(|(_k, v)| tb.eq(*v)).is_none() { 
                                                 if let Ok(key) = saturate(&tb, None) { out.insert(key, tb); }
@@ -103,7 +203,24 @@ fn Gematria() -> impl IntoView {
                         }
                         Key::Named(NamedKey::Delete) => {
                             if let Ok(key) = parse_u8_list(&txt.get()) {
-                                if let Ok(was) = forget(&key) {
+                                let alt = alt_name.get();
+                                if alt.len() != 0 {
+                                     let sr = search(alt.as_bytes(), false);
+                                        if let Ok((_found, that_one)) = sr {
+                                            if let Some(l) = that_one {
+                                                match rm_from_list(&l, &key) {
+                                                    Ok(()) => display_output.update(move |disout| {
+                                                        disout.remove_entry(&key);
+                                                    }),
+                                                    Err(e) => println!("trouble removing thing from list: {e}")
+                                                }
+                                            } else {
+                                                println!("rm from list, illegal 'nothing' removal attempt");
+                                            }
+                                        } else if let Err(e) = sr {
+                                            println!("rm from list, search error: {e}");
+                                        }
+                                } else if let Ok(was) = forget(&key) {
                                     display_output.update(move |disout| {
                                         disout.remove_entry(&key);
                                     });
@@ -113,11 +230,19 @@ fn Gematria() -> impl IntoView {
                                 }
                             }
                         }
+                        Key::Named(NamedKey::Escape) => {
+                            esc_mode.update(|n| *n = !*n);
+                        }
                         _k => {}
                     }
                 )
             }
-            row(class = "sums") {
+            row(
+                class = "sums",
+                on:click = {move |_ev| {
+                    esc_mode.update(|n| *n = false);
+                }},
+            ) {
                 column() {
                     column() {
                         text(class = "number") {{move || format!("{}",  osum.get())}}
@@ -138,11 +263,7 @@ fn Gematria() -> impl IntoView {
                             if let Ok(out) = gsearch(if o_or_r.get() { osum.get() } else { rsum.get() }, !o_or_r.get()) {
                                 display_output.update(move |disout| *disout = out);
                             }
-                            if o_or_r.get() {
-                                "o"
-                            } else {
-                                "r"
-                            }
+                            if o_or_r.get() { "o" } else { "r" }
                         }}
                     }
                     text(class = "saturate", class:sat = move || sat.get(), on:click = move |_| sat.update(move |b| *b = !*b)) { 
@@ -154,6 +275,20 @@ fn Gematria() -> impl IntoView {
                         text(class = "number") {{move || format!("{}", rsum.get())}}
                         text(class = "value") {{move || format!("reversed ")}}
                     }
+                }
+            }
+
+            if move || esc_mode.get() {
+                box(
+                    class = "esc",
+                    on:key_down = move |ev| match &ev.key {
+                        Key::Named(NamedKey::Escape) => {
+                            esc_mode.update(|n| *n = !*n);
+                        }
+                        _k => {}
+                    }
+                ) {
+                    text() { "escape" }
                 }
             }
         }
@@ -219,6 +354,33 @@ const STYLE: &str = css!("
       padding: 2px 3px;
       background: #f9f3e2;
       box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+    }
+    .esc {
+        position: absolute;
+        background: #ff278f;
+        color: #fff;
+        width: 90%;
+        height: 90vh;
+        bottom: 5vh;
+        left: 5%;
+        justify-content: center;
+        text-align: center;
+        align-items: center;
+        align-content: center;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+    }
+    .term-menu {
+        display: inline-flex;
+        background: #ff278f;
+        color: #fff;
+        width: 100%;
+        max-width: 256px;
+        height: 2cm;
+        justify-content: center;
+        text-align: center;
+        align-items: center;
+        align-content: center;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.5);
     }
 ");
 
@@ -597,9 +759,10 @@ pub fn noted_on(note: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
 /// `also_saturate`, the query is stored as a memory too unless one already equals it;
 /// its new id comes back second (and it is in the results).
 pub fn search(query: &[u8], also_saturate: bool) -> anyhow::Result<(HashMap<Vec<u8>, Vec<u8>>, Option<Vec<u8>>)> {
+    if query.len() == 0 { return Err(anyhow!("can't look for nothing")); }
     let tkns = unique_tokens(query);
     let mut out = HashMap::new();
-    let mut saturated: Option<Vec<u8>> = None;
+    let mut that_one: Option<Vec<u8>> = None;
     if !tkns.is_empty() {
         let threshold = ((tkns.len() as f32 * 0.75).ceil() as usize).max(1);
         let rx = MEMORY.begin_read()?;
@@ -615,22 +778,20 @@ pub fn search(query: &[u8], also_saturate: bool) -> anyhow::Result<(HashMap<Vec<
             if hits >= threshold {
                 if let Some(v) = mem.get(k.as_slice())? {
                     let val = v.value();
-                    if val == query {
-                        saturated = Some(k.clone());
-                    }
+                    if val == query { that_one = Some(k.clone()); }
                     out.insert(k, val.to_vec());
                 }
             }
         }
     }
-    if saturated.is_none() {
-        saturated = if also_saturate && out.par_iter().find_any(|v| v.1 == query).is_none() {
+    if that_one.is_none() {
+        that_one = if also_saturate && out.par_iter().find_any(|v| v.1 == query).is_none() {
             let id = saturate(query, None)?;
             out.insert(id.clone(), query.to_vec());
             Some(id)
         } else { None };
     }
-    Ok((out, saturated))
+    Ok((out, that_one))
 }
 
 /// memories whose ordinal (or, with `rev`, reversed) sum is `sum`
