@@ -2093,15 +2093,17 @@ dependencies = [
 
 [[package]]
 name = "neum"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rayon",
  "redb",
  "serde",
  "serde_json",
+ "tempfile",
  "zgui",
  "zgui-ui",
+ "zgui-ui-tokens",
 ]
 
 [[package]]
