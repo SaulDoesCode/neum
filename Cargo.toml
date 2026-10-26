@@ -1,16 +1,35 @@
 [package]
 name = "neum"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
+description = "ordinal, reversed and byte-sum gematria over a stateful redb memory, with lists and notes"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/SaulDoesCode/neum"
+keywords = ["gematria", "redb", "zgui", "notes"]
+categories = ["gui", "text-processing"]
+
+[lib]
+name = "neum"
+path = "src/lib.rs"
+
+[[bin]]
+name = "neum"
+path = "src/main.rs"
 
 [dependencies]
-anyhow = "*"
+anyhow = "1"
 zgui = { git = "https://github.com/zortax/zgui" }
 zgui-ui = { git = "https://github.com/zortax/zgui" }
+zgui-ui-tokens = { git = "https://github.com/zortax/zgui" }
 redb = { version = "4.4.0" }
-rayon = { version = "*"}
-serde = "*"
-serde_json = "*"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
