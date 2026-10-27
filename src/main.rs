@@ -1,6 +1,6 @@
 use zgui::{prelude::*, reactive::LocalStorage};
 use zgui_ui::prelude::*;
-use zgui_ui_tokens::prelude::{ColorScheme, ThemeProviderProps};
+use zgui_ui_tokens::prelude::{ColorScheme, Theme, ThemeProviderProps};
 
 use std::{collections::HashMap, path::Path};
 
@@ -100,6 +100,20 @@ impl Ui {
         match store::gsearch(self.active_sum(), self.mode.get_untracked()) {
             Ok(out) => self.show(out),
             Err(e) => self.say(format!("search error: {e}")),
+        }
+    }
+
+    /// the line under the bar: what was last said, else where Enter will put things
+    fn hint(self) -> String {
+        let s = self.status.get();
+        if !s.is_empty() { return s; }
+        let alt = self.alt_name.get();
+        if alt.is_empty() {
+            String::new()
+        } else if self.sch.get() {
+            format!("→ list «{alt}»")
+        } else {
+            format!("→ notes on «{alt}»")
         }
     }
 
@@ -408,8 +422,12 @@ fn Gematria(settings: Settings, greeting: String) -> impl IntoView {
         move |on: bool| ui.set(|s| s.compact_on_open = on),
     );
 
+    // the window's own background and text, so the page behind everything follows the theme
+    let light_theme = Theme::light().with_css("--zui-color-background: #f4efe3; --zui-color-foreground: #1d1a16;");
+    let dark_theme = Theme::dark().with_css("--zui-color-background: #000; --zui-color-foreground: #fff;");
+
     view! {
-        ThemeProvider(scheme = scheme) {
+        ThemeProvider(scheme = scheme, light = light_theme, dark = dark_theme) {
             column(class = "app", class:light = light) {
                 row(class = "spread",
                     on:click = {move |_ev| {
@@ -509,19 +527,10 @@ fn Gematria(settings: Settings, greeting: String) -> impl IntoView {
                             }
                         )
                     }
-                    row(class = "hint") {
-                        text() {{move || {
-                            let s = status.get();
-                            if !s.is_empty() { return s; }
-                            let alt = alt_name.get();
-                            if alt.is_empty() {
-                                String::new()
-                            } else if sch.get() {
-                                format!("→ list «{alt}»")
-                            } else {
-                                format!("→ notes on «{alt}»")
-                            }
-                        }}}
+                    if move || !ui.hint().is_empty() {
+                        row(class = "hint") {
+                            text() {{move || ui.hint()}}
+                        }
                     }
                     if move || mode.get() == Mode::Bytes {
                         column(class = "story") {
@@ -705,9 +714,11 @@ fn Gematria(settings: Settings, greeting: String) -> impl IntoView {
 }
 
 const STYLE: &str = css!("
-    :root { background-color: #000; }
+    :root {
+        background-color: var(--zui-color-background, #000);
+        color: var(--zui-color-foreground, #fff);
+    }
     .app {
-        --bg: #000;
         --fg: #fff;
         --muted: #888;
         --card: #f9f3e2;
@@ -718,13 +729,10 @@ const STYLE: &str = css!("
         --panel-muted: #a89cb2;
         --accent: #ff278f;
         --shadow: rgba(0,0,0,0.5);
-        width: 100vw;
-        height: 100vh;
-        background: var(--bg);
+        display: contents;
         color: var(--fg);
     }
     .app.light {
-        --bg: #f4efe3;
         --fg: #1d1a16;
         --muted: #9a907f;
         --card: #fffdf8;
@@ -756,10 +764,20 @@ const STYLE: &str = css!("
         border-bottom: 1px solid var(--line);
         font-size: 20px;
     }
+    .inp .zui-input, .term-menu .zui-input,
+    .inp .zui-input:focus-visible, .term-menu .zui-input:focus-visible {
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        background-color: transparent;
+        color: inherit;
+        font-family: inherit;
+        font-size: inherit;
+        line-height: inherit;
+    }
     .hint {
         width: 95%;
         max-width: 16cm;
-        min-height: 14px;
         justify-content: center;
         font-size: 12px;
         color: var(--muted);
@@ -873,7 +891,7 @@ const STYLE: &str = css!("
         background: var(--accent);
         color: #fff;
         width: 100%;
-        max-width: 320px;
+        max-width: 256px;
         height: 2cm;
         justify-content: center;
         text-align: center;

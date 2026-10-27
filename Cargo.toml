@@ -2,7 +2,7 @@
 name = "neum"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "ordinal, reversed and byte-sum gematria over a stateful redb memory, with lists and notes"
 license = "MIT"
 readme = "README.md"

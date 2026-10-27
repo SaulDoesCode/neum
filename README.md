@@ -15,7 +15,7 @@ cargo run --release -- my.memory  # opens (or makes) my.memory
 ```
 
 Linux needs the usual windowing headers to build: `libxkbcommon-dev` and `libwayland-dev`
-(and `pkg-config`). Rust 1.88 or newer.
+(and `pkg-config`). Rust 1.90 or newer.
 
 ## the bar
 
