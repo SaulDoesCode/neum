@@ -33,11 +33,9 @@ fn Gematria() -> impl IntoView {
     let term_ctx_menu = RwSignal::new(false);
 
     view! {
-        row(class = "spread",
-            on:click = {move |_ev| {
-                esc_mode.update(|n| *n = false);
-            }}
-        ) {{move || { //  'ordinary cunt' sums to 162/162
+        row(class = "spread", on:click = {move |_ev| {
+            esc_mode.update(|n| *n = false);
+        }}) {{move || { //  'ordinary cunt' sums to 162/162
             let mut els = vec![];
             for (k, v) in display_output.get() {
                 if let Ok(v) = String::from_utf8(v) {
@@ -59,7 +57,7 @@ fn Gematria() -> impl IntoView {
                                 if let Some(btn) = ev.button {
                                     if btn == PointerButton::Secondary {
                                         if ev.modifiers.control() {
-                                            let n = (osum.get() as f64 * rsum.get() as f64).sqrt().round() as u64;
+                                            let n = (o as f64 * r as f64).sqrt().round() as u64;
                                             txt.update(move |t| *t = n.to_string());
                                             if let Ok(out) = gsearch(n, !o_or_r.get()) {
                                                 display_output.update(move |disout| *disout = out);
@@ -71,7 +69,6 @@ fn Gematria() -> impl IntoView {
                             on:click = move |_ev| {
                                 let ov = ov.to_string();
                                 txt.update(move |t| *t = ov.to_string());
-                                let (o, r) = sums(txt.get().as_bytes());
                                 if osum.get() != o { osum.update(move |n| *n = o); }
                                 if rsum.get() != r { rsum.update(move |n| *n = r); }
                             }
@@ -107,16 +104,33 @@ fn Gematria() -> impl IntoView {
                     value = txt,
                     label = "type text to sum with gematria",
                     on:input = move |_| {
-                        let (o, r) = sums(txt.get().as_bytes());
-                        osum.update(move |n| *n = o);
-                        rsum.update(move |n| *n = r);
+                        if sch.get() {
+                            if let Ok(out) = search(txt.get().as_bytes(), false) {
+                                let mut k = vec![];
+                                display_output.update(move |disout| *disout = out.0);
+                                if let Some(key) = out.1 { k.extend_from_slice(&key); }
+                            }
+                        } else {
+                            let (o, r) = sums(txt.get().as_bytes());
+                            osum.update(move |n| *n = o);
+                            rsum.update(move |n| *n = r);
+                        }
                     },
                     on:click = move |_ev| {
                         esc_mode.update(|n| *n = false);
                     },
                     on:key_down = move |ev| match &ev.key {
                         Key::Named(NamedKey::Enter) => {
-                            if sch.get() {
+                            if ev.modifiers == Modifiers::SHIFT {
+                                if let Ok(key) = parse_u8_list(&txt.get()) {
+                                    if let Ok(v) = remember(&key) {
+                                        display_output.update(move |disout| {
+                                            disout.clear();
+                                            disout.insert(key, v);
+                                        });
+                                    }
+                                }
+                            } else if sch.get() {
                                 let t = txt.get();
                                 if t.len() == 0 {
                                     let alt = alt_name.get();
@@ -134,7 +148,7 @@ fn Gematria() -> impl IntoView {
                                             }
                                         } else if let Err(e) = sr {
                                             println!("search error: {e}");
-                                        } 
+                                        }
                                     }
                                 } else {
                                     let r = search(t.as_bytes(), sat.get());
@@ -163,11 +177,26 @@ fn Gematria() -> impl IntoView {
                             } else {
                                 let t = txt.get();
                                 let an = alt_name.get();
-                                if an.len() != 0 && sat.get() && t.parse::<u64>().is_err() {
+                                if an.len() == 0 && term_ctx_menu.get() {
+                                    let sr = search(t.as_bytes(), false);
+                                    if let Ok((_found, that_one)) = sr {
+                                        if let Some(this) = that_one {
+                                            match get_notes_on(&this) {
+                                                Ok(lst) => display_output.update(move |disout| *disout = lst),
+                                                Err(e) => println!("trouble fining notes on that: {e}")
+                                            }
+                                        } else {
+                                            display_output.update(move |disout| disout.clear());
+                                            println!("look no find.. that one");
+                                        }
+                                    } else if let Err(e) = sr {
+                                        println!("search error: {e}");
+                                    }
+                                } else if an.len() != 0 && sat.get() && t.parse::<u64>().is_err() {
                                     match gsearch(osum.get(), false) {
                                         Ok(mut fnd) => {
                                             let tb = t.as_bytes().to_vec();
-                                            if fnd.par_iter().find_any(|(_k, v)| tb.eq(*v)).is_none() { 
+                                            if fnd.par_iter().find_any(|(_k, v)| tb.eq(*v)).is_none() {
                                                 if let Ok(k) = saturate(&tb, None) {
                                                     let sr = search(an.as_bytes(), true);
                                                     if let Ok((_found, that_one)) = sr {
@@ -192,12 +221,27 @@ fn Gematria() -> impl IntoView {
                                     if sat.get() {
                                         if t.parse::<u64>().is_err() {
                                             let tb = txt.get().as_bytes().to_vec();
-                                            if out.par_iter().find_any(|(_k, v)| tb.eq(*v)).is_none() { 
+                                            if out.par_iter().find_any(|(_k, v)| tb.eq(*v)).is_none() {
                                                 if let Ok(key) = saturate(&tb, None) { out.insert(key, tb); }
                                             }
                                         }
                                     }
                                     display_output.update(move |disout| *disout = out);
+                                } else if t.len() == 0 && term_ctx_menu.get() {
+                                    let sr = search(an.as_bytes(), false);
+                                    if let Ok((_found, that_one)) = sr {
+                                        if let Some(this) = that_one {
+                                            match get_notes_on(&this) {
+                                                Ok(lst) => display_output.update(move |disout| *disout = lst),
+                                                Err(e) => println!("trouble fining notes on that: {e}")
+                                            }
+                                        } else {
+                                            display_output.update(move |disout| disout.clear());
+                                            println!("look no find.. that one");
+                                        }
+                                    } else if let Err(e) = sr {
+                                        println!("search error: {e}");
+                                    }
                                 }
                             }
                         }
@@ -205,9 +249,10 @@ fn Gematria() -> impl IntoView {
                             if let Ok(key) = parse_u8_list(&txt.get()) {
                                 let alt = alt_name.get();
                                 if alt.len() != 0 {
-                                     let sr = search(alt.as_bytes(), false);
-                                        if let Ok((_found, that_one)) = sr {
-                                            if let Some(l) = that_one {
+                                    let sr = search(alt.as_bytes(), false);
+                                    if let Ok((_found, that_one)) = sr {
+                                        if let Some(l) = that_one {
+                                            if sch.get() {
                                                 match rm_from_list(&l, &key) {
                                                     Ok(()) => display_output.update(move |disout| {
                                                         disout.remove_entry(&key);
@@ -215,11 +260,19 @@ fn Gematria() -> impl IntoView {
                                                     Err(e) => println!("trouble removing thing from list: {e}")
                                                 }
                                             } else {
-                                                println!("rm from list, illegal 'nothing' removal attempt");
+                                                match rm_note(&key, &l) {
+                                                    Ok(()) => display_output.update(move |disout| {
+                                                        disout.remove_entry(&key);
+                                                    }),
+                                                    Err(e) => println!("trouble removing thing from list: {e}")
+                                                }
                                             }
-                                        } else if let Err(e) = sr {
-                                            println!("rm from list, search error: {e}");
+                                        } else {
+                                            println!("rm from {}, illegal 'nothing' removal attempt", if sch.get() { "list" } else { "note" });
                                         }
+                                    } else if let Err(e) = sr {
+                                        println!("rm from {}, search error: {e}", if sch.get() { "list" } else { "note" });
+                                    }
                                 } else if let Ok(was) = forget(&key) {
                                     display_output.update(move |disout| {
                                         disout.remove_entry(&key);
@@ -258,7 +311,7 @@ fn Gematria() -> impl IntoView {
                         }
                         sch.update(move |b| *b = !*b)
                     }) { "s" }
-                    text(class = "o-or-r", class:hidden = move || sch.get(), on:click = move |_| o_or_r.update(move |b| *b = !*b)) { 
+                    text(class = "o-or-r", class:hidden = move || sch.get(), on:click = move |_| o_or_r.update(move |b| *b = !*b)) {
                         {move || {
                             if let Ok(out) = gsearch(if o_or_r.get() { osum.get() } else { rsum.get() }, !o_or_r.get()) {
                                 display_output.update(move |disout| *disout = out);
@@ -266,7 +319,7 @@ fn Gematria() -> impl IntoView {
                             if o_or_r.get() { "o" } else { "r" }
                         }}
                     }
-                    text(class = "saturate", class:sat = move || sat.get(), on:click = move |_| sat.update(move |b| *b = !*b)) { 
+                    text(class = "saturate", class:sat = move || sat.get(), on:click = move |_| sat.update(move |b| *b = !*b)) {
                         "s"
                     }
                 }
@@ -296,11 +349,11 @@ fn Gematria() -> impl IntoView {
 }
 
 const STYLE: &str = css!("
-    .col { 
+    .col {
         position: fixed;
         bottom: 0;
         width: calc(99% - 2mm);
-        gap: 12px; 
+        gap: 12px;
         align-items: center;
         justify-content: center;
         flex-flow: row wrap;
@@ -375,7 +428,8 @@ const STYLE: &str = css!("
         color: #fff;
         width: 100%;
         max-width: 256px;
-        height: 2cm;
+        height: auto;
+        padding: .25em;
         justify-content: center;
         text-align: center;
         align-items: center;
@@ -384,7 +438,7 @@ const STYLE: &str = css!("
     }
 ");
 
-fn main() -> anyhow::Result<()> { 
+fn main() -> anyhow::Result<()> {
     //println!("permsq(256) = {}", permsq(256, 256));
 
     let neum = app()
@@ -442,6 +496,9 @@ multimap!(LISTED_IN, &[u8], &[u8]);
 
 multimap!(NOTES, &[u8], &[u8]);
 multimap!(NOTED_ON, &[u8], &[u8]);
+
+//multimap!(MEMORY_BYTES, u64, &[u8]);
+//multimap!(MEMORY_BYTES_REVERSED, u64, &[u8]);
 
 multimap!(MEMORY_GEMATRIA, u64, &[u8]);
 multimap!(MEMORY_GEMATRIA_REVERSED, u64, &[u8]);
@@ -615,8 +672,6 @@ pub fn remember(this: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// FIX 2: forget a memory and every link to it. Notes are memories of their own, so the
-/// notes on it stay; they are only no longer linked to it.
 pub fn forget(this: &[u8]) -> anyhow::Result<Vec<u8>> {
     let wx = MEMORY.begin_write()?;
     let old = wx.open_table(MEMORIES)?.remove(this)?.map(|g| g.value().to_vec());
@@ -769,7 +824,7 @@ pub fn search(query: &[u8], also_saturate: bool) -> anyhow::Result<(HashMap<Vec<
         let mi = rx.open_multimap_table(MEMORY_INDEX)?;
         let mem = rx.open_table(MEMORIES)?;
         let mut scores: HashMap<Vec<u8>, usize> = HashMap::new();
-        for tkn in &tkns {
+        for tkn in &tkns { // todo hit a bucket before going through everything, trieify things
             for r in mi.get(*tkn)? {
                 *scores.entry(r?.value().to_vec()).or_insert(0) += 1;
             }
@@ -1065,7 +1120,7 @@ pub fn sums_scalar(data: &[u8]) -> (u64, u64) {
         if lc.is_ascii_lowercase() {
             let v = (lc - b'a' + 1) as u64;
             o += v;
-            r += 27 - v;
+            r += 27 - v; // set-size+1 - ordinal-sum
         }
     }
     (o, r)
@@ -1161,7 +1216,7 @@ pub fn unique_tokens(data: &[u8]) -> Vec<&[u8]> {
     tkns.dedup();
     tkns
 }
-
+/*
 #[allow(dead_code)]
 fn permsq(a: u64, b: u64) -> String {
     let mut digits = vec![1u8];
@@ -1319,3 +1374,4 @@ fn consonant(c: u8) -> u64 {
         _ => 0,
     }
 }
+*/
