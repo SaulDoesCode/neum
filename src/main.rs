@@ -3,8 +3,10 @@ use anyhow::anyhow;
 use zgui::{prelude::*};
 use zgui_ui::prelude::*;
 
+use zgui::reactive::RenderEffect;
+
 use std::{
-    sync::{LazyLock}, //time::{SystemTime, UNIX_EPOCH}, //simd::{cmp::SimdPartialEq, prelude::*},
+    sync::{RwLock}, //time::{SystemTime, UNIX_EPOCH}, //simd::{cmp::SimdPartialEq, prelude::*},
     collections::{HashMap, HashSet}
 };
 
@@ -14,7 +16,7 @@ use std::arch::x86_64::*;
 use rayon::prelude::*;
 use redb::{
     Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
-    ReadableTableMetadata, TableDefinition, WriteTransaction,
+    ReadableTableMetadata, TableDefinition, WriteTransaction, ReadTransaction,
 };
 
 use serde_json::{Value, json};
@@ -31,6 +33,47 @@ fn Gematria() -> impl IntoView {
     let display_output: RwSignal<HashMap<Vec<u8>, Vec<u8>>> = RwSignal::new(HashMap::new());
     let esc_mode = RwSignal::new(false);
     let term_ctx_menu = RwSignal::new(false);
+    // b: the byte sum bucket, the third click of the middle letter (o → r → b → o)
+    let bytes = RwSignal::new(false);
+    let bsum = RwSignal::new(ByteSums::default());
+    // the escape menu: settings, the path typed there, what was last said, and a tick to
+    // read the memory's details again
+    let cfg = RwSignal::new_local(load_settings());
+    let light = RwSignal::new(cfg.get_untracked().get("light").and_then(Value::as_bool).unwrap_or(false));
+    let path_in = RwSignal::new_local(MEMORY.path().unwrap_or_default());
+    let said = RwSignal::new_local(if MEMORY.path().is_none() { "no memory open, open one here".to_string() } else { String::new() });
+    let tick = RwSignal::new(0_u64);
+
+    // light mode is a second sheet over STYLE, swapped in and out
+    let light_sheet = Stylesheet::install("neum-light", "");
+    let light_fx = RenderEffect::new(move |_| {
+        if let Some(sheet) = &light_sheet { sheet.replace(if light.get() { LIGHT } else { "" }); }
+    });
+    on_cleanup_local(move || drop(light_fx));
+
+    // the bucket the middle letter is on, at `n` or at the bar's own sum
+    let gs = move |n: Option<u64>| -> anyhow::Result<HashMap<Vec<u8>, Vec<u8>>> {
+        if bytes.get() {
+            bsearch(n.unwrap_or(bsum.get().bytes))
+        } else {
+            gsearch(n.unwrap_or(if o_or_r.get() { osum.get() } else { rsum.get() }), !o_or_r.get())
+        }
+    };
+
+    let open_save = move |p: String| {
+        let p = p.trim().to_string();
+        match open_memory(&p, cfg.get_untracked().get("compact").and_then(Value::as_bool).unwrap_or(true)) {
+            Ok(()) => {
+                cfg.update(|c| note_save(c, &p));
+                save_settings(&cfg.get_untracked());
+                display_output.update(|disout| disout.clear());
+                path_in.set(p.clone());
+                said.set(format!("opened {p}"));
+            }
+            Err(e) => said.set(format!("{e}")),
+        }
+        tick.update(|n| *n += 1);
+    };
 
     view! {
         row(class = "spread", on:click = {move |_ev| {
@@ -42,7 +85,8 @@ fn Gematria() -> impl IntoView {
                     let ov = v.to_string();
                     let key = format!("{:?}", k).replace("\"", "").replace("[", "").replace("]", "");
                     let (o, r) = sums(v.as_bytes());
-                    let culr = color_for_sum(if o_or_r.get() { r } else { o });
+                    let bs = byte_sums(v.as_bytes());
+                    let culr = color_for_sum(if o_or_r.get() && !bytes.get() { r } else { o });
                     let unrlnclr = format!("{:?},{:?},{:?}", culr[0], culr[1], culr[2]);
 
                     els.push(view!{
@@ -57,9 +101,13 @@ fn Gematria() -> impl IntoView {
                                 if let Some(btn) = ev.button {
                                     if btn == PointerButton::Secondary {
                                         if ev.modifiers.control() {
-                                            let n = (o as f64 * r as f64).sqrt().round() as u64;
+                                            let n = if bytes.get() {
+                                                (bs.bytes as f64 * bs.reversed as f64).sqrt().round() as u64
+                                            } else {
+                                                (o as f64 * r as f64).sqrt().round() as u64
+                                            };
                                             txt.update(move |t| *t = n.to_string());
-                                            if let Ok(out) = gsearch(n, !o_or_r.get()) {
+                                            if let Ok(out) = gs(Some(n)) {
                                                 display_output.update(move |disout| *disout = out);
                                             }
                                         }
@@ -71,6 +119,7 @@ fn Gematria() -> impl IntoView {
                                 txt.update(move |t| *t = ov.to_string());
                                 if osum.get() != o { osum.update(move |n| *n = o); }
                                 if rsum.get() != r { rsum.update(move |n| *n = r); }
+                                if bsum.get() != bs { bsum.update(move |n| *n = bs); }
                             }
                         ) { text() {{v}} }
                     });
@@ -114,6 +163,8 @@ fn Gematria() -> impl IntoView {
                             let (o, r) = sums(txt.get().as_bytes());
                             osum.update(move |n| *n = o);
                             rsum.update(move |n| *n = r);
+                            let bs = byte_sums(&input_bytes(&txt.get()));
+                            bsum.update(move |n| *n = bs);
                         }
                     },
                     on:click = move |_ev| {
@@ -177,7 +228,23 @@ fn Gematria() -> impl IntoView {
                             } else {
                                 let t = txt.get();
                                 let an = alt_name.get();
-                                if an.len() == 0 && term_ctx_menu.get() {
+                                if t.len() == 0 && an.len() != 0 {
+                                    // like a list: everything the alt name was noted on
+                                    let sr = search(an.as_bytes(), false);
+                                    if let Ok((_found, that_one)) = sr {
+                                        if let Some(l) = that_one {
+                                            match get_noted_on(&l) {
+                                                Ok(lst) => display_output.update(move |disout| *disout = lst),
+                                                Err(e) => println!("trouble fining what that notes: {e}")
+                                            }
+                                        } else {
+                                            display_output.update(move |disout| disout.clear());
+                                            println!("look no find.. that one");
+                                        }
+                                    } else if let Err(e) = sr {
+                                        println!("search error: {e}");
+                                    }
+                                } else if an.len() == 0 && term_ctx_menu.get() {
                                     let sr = search(t.as_bytes(), false);
                                     if let Ok((_found, that_one)) = sr {
                                         if let Some(this) = that_one {
@@ -196,30 +263,34 @@ fn Gematria() -> impl IntoView {
                                     match gsearch(osum.get(), false) {
                                         Ok(mut fnd) => {
                                             let tb = t.as_bytes().to_vec();
-                                            if fnd.par_iter().find_any(|(_k, v)| tb.eq(*v)).is_none() {
-                                                if let Ok(k) = saturate(&tb, None) {
-                                                    let sr = search(an.as_bytes(), true);
-                                                    if let Ok((_found, that_one)) = sr {
-                                                        if let Some(l) = that_one {
-                                                            if let Err(e) = note_on(&l, &k) {
-                                                                println!("trouble noting on thing: {e}");
-                                                            }
-                                                        } else {
-                                                            println!("look no find.. that one");
+                                            // the text as it is, or saturated if it isn't yet
+                                            let k = match fnd.par_iter().find_any(|(_k, v)| tb.eq(*v)) {
+                                                Some((k, _v)) => Some(k.clone()),
+                                                None => saturate(&tb, None).ok(),
+                                            };
+                                            if let Some(k) = k {
+                                                let sr = search(an.as_bytes(), true);
+                                                if let Ok((_found, that_one)) = sr {
+                                                    if let Some(l) = that_one {
+                                                        if let Err(e) = note_on(&l, &k) {
+                                                            println!("trouble noting on thing: {e}");
                                                         }
-                                                        fnd.insert(k, tb);
-                                                    } else if let Err(e) = sr {
-                                                        display_output.update(move |disout| disout.clear());
-                                                        println!("search error: {e}");
+                                                    } else {
+                                                        println!("look no find.. that one");
                                                     }
+                                                    fnd.insert(k, tb);
+                                                } else if let Err(e) = sr {
+                                                    println!("search error: {e}");
                                                 }
                                             }
+                                            display_output.update(move |disout| *disout = fnd);
                                         },
                                         Err(e) => println!("search error: {e}")
                                     }
-                                } else if let Ok(mut out) = gsearch(if let Ok(sum) = t.parse::<u64>() && !ev.modifiers == Modifiers::CONTROL { sum } else if o_or_r.get() { osum.get() } else { rsum.get() }, !o_or_r.get()) {
+                                } else if let Ok(mut out) = gs(if let Ok(sum) = t.parse::<u64>() && ev.modifiers != Modifiers::CONTROL { Some(sum) } else { None }) {
                                     if sat.get() {
-                                        if t.parse::<u64>().is_err() {
+                                        // written bytes (104,105) in b are only looked up
+                                        if t.parse::<u64>().is_err() && !(bytes.get() && t.contains(',') && parse_u8_list(&t).is_ok()) {
                                             let tb = txt.get().as_bytes().to_vec();
                                             if out.par_iter().find_any(|(_k, v)| tb.eq(*v)).is_none() {
                                                 if let Ok(key) = saturate(&tb, None) { out.insert(key, tb); }
@@ -260,7 +331,7 @@ fn Gematria() -> impl IntoView {
                                                     Err(e) => println!("trouble removing thing from list: {e}")
                                                 }
                                             } else {
-                                                match rm_note(&key, &l) {
+                                                match rm_note(&l, &key) {
                                                     Ok(()) => display_output.update(move |disout| {
                                                         disout.remove_entry(&key);
                                                     }),
@@ -285,6 +356,7 @@ fn Gematria() -> impl IntoView {
                         }
                         Key::Named(NamedKey::Escape) => {
                             esc_mode.update(|n| *n = !*n);
+                            tick.update(|n| *n += 1);
                         }
                         _k => {}
                     }
@@ -298,25 +370,35 @@ fn Gematria() -> impl IntoView {
             ) {
                 column() {
                     column() {
-                        text(class = "number") {{move || format!("{}",  osum.get())}}
-                        text(class = "value") {{move || format!("ordinal ")}}
+                        text(class = "number") {{move || format!("{}", if bytes.get() { bsum.get().bytes } else { osum.get() })}}
+                        text(class = "value") {{move || format!("{} ", if bytes.get() { "bytes" } else { "ordinal" })}}
                     }
                 }
                 row(class = "toggles") {
                     text(class="sch", class:ing = move || sch.get(), on:click = move |_| {
                         if sch.get() {
-                            if let Ok(out) = gsearch(if o_or_r.get() { osum.get() } else { rsum.get() }, !o_or_r.get()) {
+                            if let Ok(out) = gs(None) {
                                 display_output.update(move |disout| *disout = out);
                             }
                         }
                         sch.update(move |b| *b = !*b)
                     }) { "s" }
-                    text(class = "o-or-r", class:hidden = move || sch.get(), on:click = move |_| o_or_r.update(move |b| *b = !*b)) {
+                    text(class = "o-or-r", class:hidden = move || sch.get(), on:click = move |_| {
+                        // o → r → b → o
+                        if bytes.get() {
+                            bytes.update(move |b| *b = false);
+                            o_or_r.update(move |b| *b = true);
+                        } else if o_or_r.get() {
+                            o_or_r.update(move |b| *b = false);
+                        } else {
+                            bytes.update(move |b| *b = true);
+                        }
+                    }) {
                         {move || {
-                            if let Ok(out) = gsearch(if o_or_r.get() { osum.get() } else { rsum.get() }, !o_or_r.get()) {
+                            if let Ok(out) = gs(None) {
                                 display_output.update(move |disout| *disout = out);
                             }
-                            if o_or_r.get() { "o" } else { "r" }
+                            if bytes.get() { "b" } else if o_or_r.get() { "o" } else { "r" }
                         }}
                     }
                     text(class = "saturate", class:sat = move || sat.get(), on:click = move |_| sat.update(move |b| *b = !*b)) {
@@ -325,9 +407,14 @@ fn Gematria() -> impl IntoView {
                 }
                 column() {
                     column() {
-                        text(class = "number") {{move || format!("{}", rsum.get())}}
-                        text(class = "value") {{move || format!("reversed ")}}
+                        text(class = "number") {{move || format!("{}", if bytes.get() { bsum.get().reversed } else { rsum.get() })}}
+                        text(class = "value") {{move || format!("reversed{} ", if bytes.get() { " bytes" } else { "" })}}
                     }
+                }
+            }
+            if move || bytes.get() {
+                row(class = "story") {
+                    text() {{move || byte_story(&input_bytes(&txt.get()))}}
                 }
             }
 
@@ -341,7 +428,93 @@ fn Gematria() -> impl IntoView {
                         _k => {}
                     }
                 ) {
-                    text() { "escape" }
+                    column(class = "esc-in") {
+                        text(class = "esc-h") { "escape" }
+                        {move || {
+                            tick.get();
+                            let mut els = vec![];
+                            for l in memory_info() {
+                                els.push(view!{ text(class = "esc-line") {{l}} });
+                            }
+                            els
+                        }}
+                        row(class = "esc-path") {
+                            Input(
+                                value = path_in,
+                                label = "path of a memory to open, or a .json to back up to or restore from",
+                                on:key_down = move |ev| match &ev.key {
+                                    Key::Named(NamedKey::Enter) => open_save(path_in.get()),
+                                    _k => {}
+                                }
+                            )
+                        }
+                        row(class = "esc-row") {
+                            control(tabindex = Focus::Sequential, on:click = move |_| open_save(path_in.get())) { "open" }
+                            control(tabindex = Focus::Sequential, on:click = move |_| {
+                                match close_memory() {
+                                    Some(p) => said.set(format!("closed {p}")),
+                                    None => said.set("nothing was open".into()),
+                                }
+                                display_output.update(|disout| disout.clear());
+                                tick.update(|n| *n += 1);
+                            }) { "close" }
+                            control(tabindex = Focus::Sequential, on:click = move |_| {
+                                let p = path_in.get();
+                                let to = if p.ends_with(".json") { p } else { format!("{}.json", MEMORY.path().unwrap_or_else(|| "./memory".into())) };
+                                match backup_memories_to_file(&to) {
+                                    Ok(n) => said.set(format!("{n} memories backed up to {to}")),
+                                    Err(e) => said.set(format!("backup failed: {e}")),
+                                }
+                            }) { "backup" }
+                            control(tabindex = Focus::Sequential, on:click = move |_| {
+                                let p = path_in.get();
+                                if !p.ends_with(".json") {
+                                    said.set("type the .json to restore from (into an empty memory)".into());
+                                } else {
+                                    match restore_from_file(&p) {
+                                        Ok(n) => said.set(format!("{n} memories restored from {p}")),
+                                        Err(e) => said.set(format!("restore failed: {e}")),
+                                    }
+                                }
+                                tick.update(|n| *n += 1);
+                            }) { "restore" }
+                            control(tabindex = Focus::Sequential, on:click = move |_| {
+                                match repair() {
+                                    Ok(()) => said.set("repaired: indexes rebuilt, dangling links dropped".into()),
+                                    Err(e) => said.set(format!("repair failed: {e}")),
+                                }
+                                tick.update(|n| *n += 1);
+                            }) { "repair" }
+                        }
+                        row(class = "esc-row") {
+                            {move || {
+                                let open = MEMORY.path();
+                                let mut els = vec![];
+                                for p in cfg.get().get("saves").and_then(Value::as_array).cloned().unwrap_or_default() {
+                                    let Some(p) = p.as_str().map(String::from) else { continue };
+                                    let name = std::path::Path::new(&p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone());
+                                    let on = open.as_deref() == Some(p.as_str());
+                                    els.push(view!{
+                                        control(class = "save", class:on = on, tabindex = Focus::Sequential, on:click = move |_| open_save(p.clone())) {{name}}
+                                    });
+                                }
+                                els
+                            }}
+                        }
+                        row(class = "esc-row") {
+                            control(tabindex = Focus::Sequential, on:click = move |_| {
+                                light.update(|l| *l = !*l);
+                                cfg.update(|c| c["light"] = json!(light.get_untracked()));
+                                save_settings(&cfg.get_untracked());
+                            }) {{move || if light.get() { "dark mode" } else { "light mode" }}}
+                            control(tabindex = Focus::Sequential, on:click = move |_| {
+                                let on = !cfg.get_untracked().get("compact").and_then(Value::as_bool).unwrap_or(true);
+                                cfg.update(|c| c["compact"] = json!(on));
+                                save_settings(&cfg.get_untracked());
+                            }) {{move || format!("compact on open: {}", if cfg.get().get("compact").and_then(Value::as_bool).unwrap_or(true) { "on" } else { "off" })}}
+                        }
+                        text(class = "esc-said") {{move || said.get()}}
+                    }
                 }
             }
         }
@@ -436,10 +609,58 @@ const STYLE: &str = css!("
         align-content: center;
         box-shadow: 0 1px 3px rgba(0,0,0,0.5);
     }
+    .story {
+        width: 80%;
+        justify-content: center;
+        text-align: center;
+        font-size: 12px;
+        color: #888;
+    }
+    .esc-in {
+        width: 100%;
+        height: 100%;
+        gap: 6px;
+        padding: 3mm;
+        align-items: center;
+        justify-content: center;
+        overflow-y: auto;
+    }
+    .esc-h { font-size: 20px; margin-bottom: 2mm; }
+    .esc-line { font-size: 13px; }
+    .esc-path {
+        width: 90%;
+        max-width: 12cm;
+        margin-top: 2mm;
+        padding: 1mm;
+        border-bottom: 1px solid #fff;
+    }
+    .esc-row {
+        flex-flow: row wrap;
+        gap: 6px;
+        justify-content: center;
+        margin-top: 1mm;
+    }
+    .save { font-size: 13px; }
+    .save.on { background: #e30e55; }
+    .esc-said { font-size: 12px; min-height: 14px; margin-top: 2mm; }
 ");
 
 fn main() -> anyhow::Result<()> {
     //println!("permsq(256) = {}", permsq(256, 256));
+
+    // NEUM_MEMORY, else the last memory open, else ./memory; one that won't open leaves the
+    // window up, and esc can open another
+    let mut cfg = load_settings();
+    let path = std::env::var("NEUM_MEMORY").ok()
+        .or_else(|| cfg.get("memory").and_then(Value::as_str).filter(|p| !p.is_empty()).map(String::from))
+        .unwrap_or_else(|| "./memory".into());
+    match open_memory(&path, cfg.get("compact").and_then(Value::as_bool).unwrap_or(true)) {
+        Ok(()) => {
+            note_save(&mut cfg, &path);
+            save_settings(&cfg);
+        }
+        Err(e) => println!("{e}"),
+    }
 
     let neum = app()
         .with_title("Neum") // .with_decorations(Decorations::NoTitleBar)
@@ -497,25 +718,63 @@ multimap!(LISTED_IN, &[u8], &[u8]);
 multimap!(NOTES, &[u8], &[u8]);
 multimap!(NOTED_ON, &[u8], &[u8]);
 
-//multimap!(MEMORY_BYTES, u64, &[u8]);
+multimap!(MEMORY_BYTES, u64, &[u8]);
 //multimap!(MEMORY_BYTES_REVERSED, u64, &[u8]);
 
 multimap!(MEMORY_GEMATRIA, u64, &[u8]);
 multimap!(MEMORY_GEMATRIA_REVERSED, u64, &[u8]);
 
-/// the database: `./memory` as before, or the path in NEUM_MEMORY (tests use that)
-static MEMORY: LazyLock<Database> = LazyLock::new(|| {
-    let path = std::env::var("NEUM_MEMORY").unwrap_or_else(|_| "./memory".into());
-    let mut db = Database::create(path).expect("opening/creating db had issues");
-    init_state(&mut db).expect("state init failed");
-    db
-});
+/// the open memory, like a game save: `./memory` as before, or the path in NEUM_MEMORY,
+/// or the last one opened; the escape menu opens another in its place or closes it
+static MEMORY: Memory = Memory(RwLock::new(None));
 
-fn init_state(db: &mut Database) -> anyhow::Result<()> {
+struct Memory(RwLock<Option<(Database, String)>>);
+
+impl Memory {
+    fn begin_write(&self) -> anyhow::Result<WriteTransaction> {
+        match &*self.0.read().unwrap_or_else(|e| e.into_inner()) {
+            Some((db, _)) => Ok(db.begin_write()?),
+            None => Err(anyhow!("no memory open, esc to open one")),
+        }
+    }
+
+    fn begin_read(&self) -> anyhow::Result<ReadTransaction> {
+        match &*self.0.read().unwrap_or_else(|e| e.into_inner()) {
+            Some((db, _)) => Ok(db.begin_read()?),
+            None => Err(anyhow!("no memory open, esc to open one")),
+        }
+    }
+
+    fn path(&self) -> Option<String> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(_, p)| p.clone())
+    }
+}
+
+/// open the memory at `path` in place of the one open (that one stays if this one won't open)
+pub fn open_memory(path: &str, compact: bool) -> anyhow::Result<()> {
+    if path.trim().is_empty() { return Err(anyhow!("a memory needs a path")); }
+    if MEMORY.path().as_deref() == Some(path) { return Ok(()); }
+    let mut db = Database::create(path).map_err(|e| anyhow!("can't open {path}: {e}"))?;
+    init_state(&mut db, compact)?;
+    *MEMORY.0.write().unwrap_or_else(|e| e.into_inner()) = Some((db, path.to_string()));
+    Ok(())
+}
+
+/// put the open memory away, saying where it was
+pub fn close_memory() -> Option<String> {
+    MEMORY.0.write().unwrap_or_else(|e| e.into_inner()).take().map(|(_, p)| p)
+}
+
+fn init_state(db: &mut Database, compact: bool) -> anyhow::Result<()> {
     let wx = db.begin_write()?;
     ensure_tables(&wx)?;
+    // a memory from before the byte bucket gets it filled in
+    if wx.open_multimap_table(MEMORY_BYTES)?.len()? == 0 && !wx.open_table(MEMORIES)?.is_empty()? {
+        repair_in(&wx)?;
+        println!("memory filled its byte bucket");
+    }
     wx.commit()?;
-    if db.compact()? {
+    if compact && db.compact()? {
         println!("memory db compacted");
     }
     Ok(())
@@ -529,6 +788,7 @@ fn ensure_tables(wx: &WriteTransaction) -> anyhow::Result<()> {
     }
     wx.open_multimap_table(MEMORY_GEMATRIA)?;
     wx.open_multimap_table(MEMORY_GEMATRIA_REVERSED)?;
+    wx.open_multimap_table(MEMORY_BYTES)?;
     Ok(())
 }
 
@@ -605,6 +865,7 @@ fn index(wx: &WriteTransaction, id: &[u8], value: &[u8]) -> anyhow::Result<()> {
     let (f, r) = sums(value);
     wx.open_multimap_table(MEMORY_GEMATRIA)?.insert(f, id)?;
     wx.open_multimap_table(MEMORY_GEMATRIA_REVERSED)?.insert(r, id)?;
+    wx.open_multimap_table(MEMORY_BYTES)?.insert(byte_sum(value), id)?;
     let mut memi = wx.open_multimap_table(MEMORY_INDEX)?;
     for tk in unique_tokens(value) {
         memi.insert(tk, id)?;
@@ -616,6 +877,7 @@ fn unindex(wx: &WriteTransaction, id: &[u8], value: &[u8]) -> anyhow::Result<()>
     let (f, r) = sums(value);
     wx.open_multimap_table(MEMORY_GEMATRIA)?.remove(f, id)?;
     wx.open_multimap_table(MEMORY_GEMATRIA_REVERSED)?.remove(r, id)?;
+    wx.open_multimap_table(MEMORY_BYTES)?.remove(byte_sum(value), id)?;
     let mut memi = wx.open_multimap_table(MEMORY_INDEX)?;
     for tk in unique_tokens(value) {
         memi.remove(tk, id)?;
@@ -797,6 +1059,21 @@ pub fn get_notes_on(this: &[u8]) -> anyhow::Result<HashMap<Vec<u8>, Vec<u8>>> {
     Ok(found)
 }
 
+/// the memories a note is on, by key (what the alt name was noted on, shown like a list)
+pub fn get_noted_on(note: &[u8]) -> anyhow::Result<HashMap<Vec<u8>, Vec<u8>>> {
+    let rx = MEMORY.begin_read()?;
+    let noted = rx.open_multimap_table(NOTED_ON)?;
+    let memories = rx.open_table(MEMORIES)?;
+    let mut found = HashMap::new();
+    for r in noted.get(note)? {
+        let k = r?;
+        if let Some(v) = memories.get(k.value())? {
+            found.insert(k.value().to_vec(), v.value().to_vec());
+        }
+    }
+    Ok(found)
+}
+
 /// what a note is on
 pub fn noted_on(note: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     let rx = MEMORY.begin_read()?;
@@ -864,6 +1141,21 @@ pub fn gsearch(sum: u64, rev: bool) -> anyhow::Result<HashMap<Vec<u8>, Vec<u8>>>
     Ok(out)
 }
 
+/// memories whose byte sum, Σ (b + 1), is `sum`
+pub fn bsearch(sum: u64) -> anyhow::Result<HashMap<Vec<u8>, Vec<u8>>> {
+    let rx = MEMORY.begin_read()?;
+    let mem = rx.open_table(MEMORIES)?;
+    let memb = rx.open_multimap_table(MEMORY_BYTES)?;
+    let mut out = HashMap::new();
+    for r in memb.get(sum)? {
+        let k = r?;
+        if let Some(v) = mem.get(k.value())? {
+            out.insert(k.value().to_vec(), v.value().to_vec());
+        }
+    }
+    Ok(out)
+}
+
 // ---- repair ----
 
 /// rebuild what can be rebuilt and drop what points at nothing (see the module notes)
@@ -886,6 +1178,7 @@ fn repair_in(wx: &WriteTransaction) -> anyhow::Result<()> {
     wx.delete_multimap_table(MEMORY_INDEX)?;
     wx.delete_multimap_table(MEMORY_GEMATRIA)?;
     wx.delete_multimap_table(MEMORY_GEMATRIA_REVERSED)?;
+    wx.delete_multimap_table(MEMORY_BYTES)?;
     for (k, v) in &all {
         index(wx, k, v)?;
     }
@@ -1234,6 +1527,7 @@ fn permsq(a: u64, b: u64) -> String {
     }
     digits.into_iter().map(|d| (d + b'0') as char).collect()
 }
+*/
 
 /// the byte sums of some data
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1261,6 +1555,7 @@ impl ByteSums {
 }
 
 /// the value of one byte: 1 ..= 256
+#[allow(dead_code)]
 pub fn value(b: u8) -> u64 {
     b as u64 + 1
 }
@@ -1353,6 +1648,123 @@ pub fn pf_reduction(s: u64) -> (Vec<u64>, u64, u64) {
     (chain, total, digit_sum(total))
 }
 
+/// the bytes an input stands for: `104,105` (the way keys are written) as those bytes,
+/// anything else as its own bytes
+fn input_bytes(t: &str) -> Vec<u8> {
+    if t.contains(',') {
+        if let Ok(b) = parse_u8_list(t) { if !b.is_empty() { return b; } }
+    }
+    t.as_bytes().to_vec()
+}
+
+/// the byte sum story of some bytes, in a line: length, mean, digit sum, roots, the byte
+/// sum's prime factors and its pf reduction
+fn byte_story(data: &[u8]) -> String {
+    let bs = byte_sums(data);
+    if bs.len == 0 { return String::new(); }
+    let [rb, rr, rd] = bs.roots();
+    let pf = prime_factors(bs.bytes);
+    let pf = match pf.len() { 0 => "·".to_string(), 1 => "prime".to_string(), _ => pf.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("×") };
+    let (chain, total, td) = pf_reduction(bs.bytes);
+    let chain = chain.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("→");
+    format!(
+        "{} bytes · mean {:.1} · digits {} · roots {rb} {rr} {rd} · {} = {pf} · {chain} ⇒ {total} ⇒ {td}",
+        bs.len, bs.mean(), bs.digits, bs.bytes
+    )
+}
+
+fn human_bytes(n: u64) -> String {
+    match n {
+        n if n < 1024 => format!("{n} B"),
+        n if n < 1024 * 1024 => format!("{:.1} KiB", n as f64 / 1024.0),
+        n => format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+/// what the escape menu says about the open memory, a line each
+fn memory_info() -> Vec<String> {
+    let Some(path) = MEMORY.path() else { return vec!["no memory open".into()] };
+    let info = || -> anyhow::Result<Vec<String>> {
+        let rx = MEMORY.begin_read()?;
+        let mem = rx.open_table(MEMORIES)?;
+        let mut stored = 0;
+        for r in mem.iter()? { stored += r?.1.value().len() as u64; }
+        let keys_and_len = |t: MultimapTableDefinition<&[u8], &[u8]>| -> anyhow::Result<(u64, u64)> {
+            let (mut keys, mut len) = (0, 0);
+            for r in rx.open_multimap_table(t)?.iter()? {
+                keys += 1;
+                len += r?.1.len();
+            }
+            Ok((keys, len))
+        };
+        let (lists, listed) = keys_and_len(LISTS)?;
+        let (noted, notes) = keys_and_len(NOTED_ON)?;
+        let (_, reuse) = keys_and_len(TO_REUSE)?;
+        let last = rx.open_table(STATE)?.get(ALLOCATED)?.map(|g| format!("{:?}", g.value())).unwrap_or_else(|| "none".into());
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Ok(vec![
+            path.clone(),
+            format!("{} on disk", human_bytes(size)),
+            format!("{} memories, {} of them", mem.len()?, human_bytes(stored)),
+            format!("{lists} lists holding {listed}"),
+            format!("{noted} notes on {notes}"),
+            format!("last id {last}, {reuse} ids to reuse"),
+        ])
+    };
+    info().unwrap_or_else(|e| vec![path.clone(), format!("{e}")])
+}
+
+// ---- settings ----
+
+/// where settings live: NEUM_CONFIG, else neum/settings.json in the config folder
+fn settings_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("NEUM_CONFIG") { return p.into(); }
+    let base = std::env::var("XDG_CONFIG_HOME").ok().filter(|p| !p.is_empty()).map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("APPDATA").ok().map(std::path::PathBuf::from))
+        .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".config")));
+    match base {
+        Some(b) => b.join("neum").join("settings.json"),
+        None => "./neum-settings.json".into(),
+    }
+}
+
+/// {"light": bool, "compact": bool, "memory": last path, "saves": [paths, newest first]}
+fn load_settings() -> Value {
+    std::fs::read_to_string(settings_path()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({ "light": false, "compact": true, "memory": "", "saves": [] }))
+}
+
+fn save_settings(v: &Value) {
+    let p = settings_path();
+    if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
+    if let Err(e) = std::fs::write(&p, serde_json::to_string_pretty(v).unwrap_or_default()) {
+        println!("couldn't keep settings at {}: {e}", p.display());
+    }
+}
+
+/// `path` was opened: first among the saves, and the one to open next time
+fn note_save(v: &mut Value, path: &str) {
+    let mut saves: Vec<Value> = v.get("saves").and_then(Value::as_array).cloned().unwrap_or_default();
+    saves.retain(|p| p.as_str() != Some(path));
+    saves.insert(0, json!(path));
+    saves.truncate(8);
+    v["saves"] = json!(saves);
+    v["memory"] = json!(path);
+}
+
+const LIGHT: &str = css!("
+    :root { background-color: #f4efe3; }
+    .col { color: #1d1a16; }
+    .inp { border-bottom: 1px solid #1d1a16; }
+    .saturate, .sch { color: #a39a8a; }
+    .sat, .ing { color: #1d1a16; }
+    .otxt { background: #fffdf8; box-shadow: 0 1px 3px rgba(60,40,20,0.3); }
+    .story { color: #7d7365; }
+");
+
+/*
 #[allow(dead_code)]
 fn vowel(c: u8) -> u64 {
     match c {
@@ -1375,3 +1787,128 @@ fn consonant(c: u8) -> u64 {
     }
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..len).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 24) as u8 }).collect()
+    }
+
+    #[test]
+    fn sums_are_sums() {
+        assert_eq!(sums(b"ordinary cunt"), (162, 162));
+        assert_eq!(sums(b"a"), (1, 26));
+        assert_eq!(sums(b"Z"), (26, 1));
+        assert_eq!(sums(b"@`[{ 123"), (0, 0));
+        for len in [0, 1, 31, 32, 33, 127, 128, 129, 1000] {
+            for seed in 0..8 {
+                let d = noise(seed + len as u64, len);
+                assert_eq!(sums(&d), sums_scalar(&d), "len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn tokens_are_tokens() {
+        assert_eq!(unique_tokens(b"a b a\tc\r\nb"), vec![&b"a"[..], b"b", b"c"]);
+        for len in [0, 5, 31, 32, 33, 64, 65, 777] {
+            for seed in 0..8 {
+                let d: Vec<u8> = noise(seed * 31 + len as u64, len).into_iter()
+                    .map(|b| match b % 6 { 0 => b' ', 1 => b'\n', _ => b'a' + b % 26 }).collect();
+                assert_eq!(tokenate(&d), tokenize_scalar(&d), "len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn byte_sums_and_stories() {
+        let bs = byte_sums(b"hi");
+        assert_eq!((bs.bytes, bs.reversed, bs.len), (211, 303, 2));
+        assert_eq!(bs.bytes, byte_sum(b"hi"));
+        assert_eq!(input_bytes("104,105"), b"hi".to_vec());
+        assert_eq!(input_bytes("hi"), b"hi".to_vec());
+        assert_eq!(input_bytes("162"), b"162".to_vec());
+        assert_eq!(byte_story(&input_bytes("104,105")), byte_story(b"hi"));
+        assert!(byte_story(b"hi").contains("211 = prime"));
+        assert_eq!(byte_story(b""), "");
+        assert_eq!(prime_factors(1038), vec![2, 3, 173]);
+        for n in 0..3000 {
+            let (chain, total, td) = pf_reduction(n);
+            assert!(!chain.is_empty() && chain.len() <= 33);
+            assert_eq!(td, digit_sum(total));
+        }
+        assert_eq!(next_id(&[255]).unwrap(), vec![0, 0]);
+        assert!(next_id(&[255, 255, 255, 255]).is_err());
+    }
+
+    /// the memory is one per process, so it is all one test
+    #[test]
+    fn memories_like_game_saves() {
+        let dir = std::env::temp_dir().join(format!("neum-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (one, two) = (dir.join("one").display().to_string(), dir.join("two").display().to_string());
+        let _ = std::fs::remove_file(&one);
+        let _ = std::fs::remove_file(&two);
+
+        assert!(saturate(b"nowhere", None).is_err(), "nothing open, nothing done");
+        open_memory(&one, false).unwrap();
+        let a = saturate(b"count your says", None).unwrap();
+        let b = saturate(b"just a regular friday", None).unwrap();
+        assert_eq!((a.clone(), b.clone()), (vec![0], vec![1]));
+        assert!(gsearch(sums(b"count your says").0, false).unwrap().contains_key(&a));
+        assert!(gsearch(sums(b"count your says").1, true).unwrap().contains_key(&a));
+        assert!(bsearch(byte_sum(b"count your says")).unwrap().contains_key(&a));
+
+        // lists, and notes the way the bar makes them: the alt name is a note on the text
+        let alt = saturate(b"songs", None).unwrap();
+        add_to_list(&alt, &a).unwrap();
+        assert_eq!(get_list(&alt).unwrap().len(), 1);
+        note_on(&alt, &b).unwrap();
+        assert!(get_noted_on(&alt).unwrap().contains_key(&b));
+        assert!(get_notes_on(&b).unwrap().contains_key(&alt));
+        rm_note(&alt, &b).unwrap();
+        assert!(get_noted_on(&alt).unwrap().is_empty(), "delete undoes enter");
+
+        // forget, and the id comes back
+        assert_eq!(forget(&a).unwrap(), b"count your says");
+        assert!(get_list(&alt).unwrap().is_empty());
+        assert!(bsearch(byte_sum(b"count your says")).unwrap().is_empty());
+        assert_eq!(saturate(b"again", None).unwrap(), a);
+
+        let json = dir.join("one.json").display().to_string();
+        assert_eq!(backup_memories_to_file(&json).unwrap(), 3);
+        assert!(memory_info().iter().any(|l| l.contains("3 memories")));
+
+        // another save, restored from the backup, then back to the first
+        open_memory(&two, false).unwrap();
+        assert!(remember(&b).is_err());
+        assert_eq!(restore_from_file(&json).unwrap(), 3);
+        assert!(bsearch(byte_sum(b"again")).unwrap().contains_key(&a));
+        assert!(restore_from_file(&json).is_err(), "restore wants an empty memory");
+        open_memory(&one, false).unwrap();
+        assert_eq!(remember(&b).unwrap(), b"just a regular friday");
+
+        assert_eq!(close_memory(), Some(one.clone()));
+        assert!(remember(&b).is_err());
+        assert_eq!(memory_info(), vec!["no memory open".to_string()]);
+        // closed, the file is free to open again
+        open_memory(&one, true).unwrap();
+        assert_eq!(remember(&b).unwrap(), b"just a regular friday");
+        close_memory();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saves_newest_first() {
+        let mut v = json!({ "saves": [] });
+        for i in 0..10 { note_save(&mut v, &format!("/m{i}")); }
+        note_save(&mut v, "/m4");
+        let saves = v["saves"].as_array().unwrap();
+        assert_eq!(saves.len(), 8);
+        assert_eq!(saves[0], "/m4");
+        assert_eq!(v["memory"], "/m4");
+    }
+}
